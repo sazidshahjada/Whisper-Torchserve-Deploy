@@ -1,0 +1,6 @@
+deviceType: gpu
+minWorkers: 1
+maxWorkers: 1
+batchSize: 1
+maxBatchDelay: 100
+responseTimeout: 240
