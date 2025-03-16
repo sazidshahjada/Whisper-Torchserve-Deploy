@@ -5,6 +5,8 @@ import librosa
 import soundfile as sf
 import numpy as np
 import logging
+import subprocess
+import tempfile
 from io import BytesIO
 from ts.torch_handler.base_handler import BaseHandler
 
@@ -82,21 +84,72 @@ class WhisperHandler(BaseHandler):
             logger.error(f"Error loading model: {e}")
             raise e
 
+    def extract_audio_from_file(self, file_bytes):
+        """
+        Extract audio from any file (audio or video) using ffmpeg.
+        
+        Explanation:
+        - Writes the file bytes to a temporary file.
+        - Uses ffmpeg to convert the input file into a WAV file with 16000 Hz sample rate and mono channel.
+        - Reads the WAV file with soundfile and then cleans up temporary files.
+        This method should work regardless of the input file format.
+        """
+        try:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".tmp") as tmp_input:
+                tmp_input.write(file_bytes)
+                input_path = tmp_input.name
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_audio:
+                output_path = tmp_audio.name
+
+            command = [
+                "ffmpeg", "-y", "-i", input_path,
+                "-ar", "16000", "-ac", "1",
+                "-f", "wav", output_path
+            ]
+            logger.info(f"Extracting audio using ffmpeg: {' '.join(command)}")
+            result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            if result.returncode != 0:
+                logger.error(f"ffmpeg error: {result.stderr.decode()}")
+                raise Exception("Failed to extract audio from input file")
+            
+            y, sr = sf.read(output_path)
+            os.remove(input_path)
+            os.remove(output_path)
+            return y, sr
+        except Exception as e:
+            logger.error(f"Error during audio extraction: {e}")
+            raise e
+
     def preprocess(self, data):
         """
         Preprocess audio data.
-        Loads the complete audio, converts to mono and resamples if needed.
+        Loads the complete audio (or other file formats), converts to mono and resamples if needed.
+        If the input file is not recognized as native audio (WAV, Ogg, MP3, FLAC), 
+        the file is processed using ffmpeg to extract the audio.
         """
         audio_data = data[0].get("audio")
         
         try:
             if isinstance(audio_data, (bytes, bytearray)):
                 audio_bytes = BytesIO(audio_data)
-                y, sr = sf.read(audio_bytes)
-                if y.ndim > 1:  # Convert stereo to mono
+                head = audio_bytes.read(12)
+                audio_bytes.seek(0)
+                
+                # Check for known native audio headers:
+                # WAV files usually start with "RIFF",
+                # Ogg files with "OggS",
+                # MP3 files might start with "ID3",
+                # FLAC files start with "fLaC".
+                if head.startswith(b"RIFF") or head.startswith(b"OggS") or head[:3] == b"ID3" or head.startswith(b"fLaC"):
+                    logger.info("Detected native audio file format.")
+                    y, sr = sf.read(audio_bytes)
+                else:
+                    logger.info("Input file format not recognized as native audio; attempting extraction via ffmpeg.")
+                    y, sr = self.extract_audio_from_file(audio_bytes.read())
+                    
+                if y.ndim > 1:  # Convert stereo to mono if needed.
                     y = y.mean(axis=1)
                 logger.info(f"Original sample rate: {sr}")
-                
                 if sr != 16000:
                     logger.info(f"Resampling from {sr} to 16000")
                     y = librosa.resample(y, orig_sr=sr, target_sr=16000)
@@ -106,7 +159,6 @@ class WhisperHandler(BaseHandler):
                 logger.info(f"Audio duration: {duration} seconds")
                 
                 # NEW CODE: Uncomment below to fix the audio length to FIXED_DURATION_SECONDS.
-                
                 # FIXED_DURATION_SECONDS = 30  # Set desired fixed duration in seconds.
                 # required_samples = int(FIXED_DURATION_SECONDS * sr)
                 # if len(y) < required_samples:
@@ -118,7 +170,6 @@ class WhisperHandler(BaseHandler):
                 #     y = y[:required_samples]
                 # logger.info(f"Fixed audio length: {len(y)/sr:.2f} seconds")
                 
-                # Return the processed audio
                 return y
             else:
                 return audio_data
@@ -131,9 +182,30 @@ class WhisperHandler(BaseHandler):
         Run inference on the full (untrimmed) audio.
         """
         logger.info(f"Running inference on {self.device}")
-        
+
         try:
-            # If data is a list (which may result from chunking in other implementations)
+            # If the data is not already a list, split the full audio into chunks.
+
+
+            # if not isinstance(data, list):
+            #     logger.info("Full audio provided, splitting into chunks...")
+            #     # Define fixed chunk duration in seconds.
+            #     chunk_duration_seconds = 30  # adjust as needed
+            #     sample_rate = 16000  # Expected sample rate after preprocessing.
+            #     chunk_length = int(chunk_duration_seconds * sample_rate)
+            #     total_length = len(data)
+            #     num_chunks = (total_length + chunk_length - 1) // chunk_length
+            #     logger.info(f"Audio length: {total_length} samples. Splitting into {num_chunks} chunk(s) of {chunk_length} samples each.")
+                
+            #     chunks = []
+            #     for i in range(num_chunks):
+            #         start = i * chunk_length
+            #         end = min((i + 1) * chunk_length, total_length)
+            #         chunk = data[start:end]
+            #         chunks.append(chunk)
+            #     data = chunks
+
+
             # process each chunk; otherwise, process the full audio.
             if isinstance(data, list):
                 transcriptions = []
@@ -142,7 +214,7 @@ class WhisperHandler(BaseHandler):
                     # Process each chunk as-is.
                     audio_tensor = torch.tensor(chunk, dtype=torch.float32, device=self.device)
                     with torch.no_grad():
-                        result = whisper.transcribe(self.model, audio_tensor, language="en", temperature=0)
+                        result = self.model.transcribe(audio_tensor, language="en", temperature=0)
                     transcriptions.append(result['text'])
                 final_text = " ".join(transcriptions)
                 logger.info("Inference complete for all chunks")
